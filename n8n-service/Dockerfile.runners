@@ -1,0 +1,21 @@
+FROM n8nio/runners:2.6.4
+USER root
+RUN cd /opt/runners/task-runner-python && uv pip install \
+    numpy \
+    pandas \
+    backtesting \
+    ta \
+    requests \
+    matplotlib \
+    httpx \
+    python-dotenv \
+    beautifulsoup4 \
+    lxml \
+    openai \
+    supabase \
+    langchain \
+    langchain-google-genai \
+    backtrader \
+    ccxt
+COPY n8n-task-runners.json /etc/n8n-task-runners.json
+USER runner

@@ -15,7 +15,14 @@ RUN cd /opt/runners/task-runner-python && uv pip install \
     supabase \
     langchain \
     langchain-google-genai \
+    langchain-core \
+    langchain-community \
+    langchain-text-splitters \
     backtrader \
     ccxt
 COPY n8n-task-runners.json /etc/n8n-task-runners.json
 USER runner
+
+
+
+

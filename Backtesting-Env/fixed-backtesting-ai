@@ -1,0 +1,2990 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Make sure only Part New Python code in output.\n\nStrict output i want is - {\n\t\"new_python_code\": \"string\"\n}\n\nReplace Entry/Exit Logic of current Code and give me updated code with new Entry/Exit Logic.\n\n  \n   --entry_long \"{{ $('When Executed by Another Workflow').item.json['Entry Long'] }}\" \\\n  --entry_short \"{{ $('When Executed by Another Workflow').item.json['Entry Short'] }}\" \\\n  --exit_long \"{{ $('When Executed by Another Workflow').item.json['Exit Long'] }}\" \\\n  --exit_short \"{{ $('When Executed by Another Workflow').item.json['Exit Short'] }}\" \\\n\nMake sure don't miss any part and fix all block of code correctly.\n\nColumns name to use for DB mapping - {{ $('Column Name Agent').item.json.output.columns }}\n\nPython code to fix --- \n\n#!/usr/bin/env python3\nimport pandas as pd\nimport numpy as np\nimport os\nimport argparse\nfrom dotenv import load_dotenv\n\nload_dotenv()\n\n# ==========================================\n# 1. USER CONFIGURATION\n# ==========================================\nclass TemplateConfig:\n    SUPABASE_URL    = os.getenv(\"SUPABASE_URL\")\n    SUPABASE_KEY    = os.getenv(\"SUPABASE_KEY\")\n    TABLE_NAME      = \"ETH_4H_TAAPI_Indicator_snapshot\"\n    EXIT_TABLE_NAME = \"ETH_1H_TAAPI_Indicator_snapshot\"\n    CASH            = 1000000\n    COMMISSION      = 0.0003\n    MARGIN          = 0.33\n    TRADE_ON_CLOSE  = False\n    ALLOW_FLIPPING  = True\n\n    # ── TP / SL — set ATR-based OR fixed-pct, or leave None to disable ──\n    # ATR-based  : TP = entry ± (TP_ATR_MULT * atr_value)\n    #              SL = entry ± (SL_ATR_MULT * atr_value)\n    TP_ATR_MULT = None   # e.g. 3.0\n    SL_ATR_MULT = None   # e.g. 1.5\n\n    # Fixed-pct  : TP = entry ± (TP_PCT * entry)\n    #              SL = entry ± (SL_PCT * entry)\n    TP_PCT      = None   # e.g. 0.03  → 3%\n    SL_PCT      = None   # e.g. 0.015 → 1.5%\n\n\n# ==========================================\n# 2. TIME RESTRICTIONS\n# ==========================================\ndef is_downtime(dt_iso):\n    ist_time = dt_iso + pd.Timedelta(hours=5, minutes=30)\n    weekday  = ist_time.weekday()\n    hour     = ist_time.hour\n    if weekday == 5 and hour >= 7: return True\n    if weekday == 6 and hour < 19: return True\n    return False\n\n\n# ==========================================\n# 3. SUPABASE DATA LOADER\n# ==========================================\ndef load_data(config: TemplateConfig, needed_cols: list, table_name: str = None) -> pd.DataFrame:\n    target_table = table_name if table_name else config.TABLE_NAME\n\n    if not config.SUPABASE_URL or not config.SUPABASE_KEY:\n        raise ValueError(\"Missing SUPABASE_URL or SUPABASE_KEY in environment variables.\")\n\n    from supabase import create_client\n    supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)\n\n    cols_str  = \"*\"\n    limit     = 5000 if '1H' in target_table.upper() else 15000\n    print(f\"Fetching data from table: {target_table} (Max {limit} rows)...\")\n\n    all_data  = []\n    page_size = 1000\n    try:\n        for offset in range(0, limit, page_size):\n            response = (\n                supabase.table(target_table)\n                .select(cols_str)\n                .order('timestamp', desc=True)\n                .range(offset, offset + page_size - 1)\n                .execute()\n            )\n            if hasattr(response, 'error') and response.error:\n                raise ValueError(f\"Supabase Error: {response.error}\")\n            if not response.data: break\n            all_data.extend(response.data)\n            if len(response.data) < page_size: break\n    except Exception as e:\n        print(f\"Fetch failed: {e}\")\n        raise e\n\n    df = pd.DataFrame(all_data)\n    if df.empty:\n        raise ValueError(f\"No data found in Supabase table: {target_table}\")\n    print(f\"Data fetched: {len(df)} rows.\")\n\n    df.columns = [c.lower() for c in df.columns]\n\n    # ── Validate all needed_cols exist right after load ────────────────\n    needed_lower = [c.lower() for c in needed_cols]\n    missing_cols = [c for c in needed_lower if c not in df.columns]\n    if missing_cols:\n        raise ValueError(\n            f\"\\n[FATAL] The following required columns are MISSING from table \"\n            f\"'{target_table}':\\n  {missing_cols}\\n\"\n            f\"Available columns: {sorted(df.columns.tolist())}\"\n        )\n\n    ts_col = 'timestamp' if 'timestamp' in df.columns else None\n    if not ts_col:\n        time_cols = [c for c in df.columns if 'time' in c.lower()]\n        if time_cols: ts_col = time_cols[0]\n\n    if ts_col:\n        print(f\"Converting timestamp column: {ts_col}\")\n        try:\n            sample     = df[ts_col].iloc[0]\n            ts_numeric = pd.to_numeric(sample, errors='coerce')\n            if pd.isna(ts_numeric):\n                df[ts_col] = pd.to_datetime(df[ts_col])\n            else:\n                val  = float(ts_numeric)\n                unit = 's' if val < 1e12 else 'ms'\n                df[ts_col] = pd.to_datetime(df[ts_col].astype(float), unit=unit)\n            df.set_index(ts_col, inplace=True)\n        except Exception as e:\n            print(f\"Timestamp conversion error: {e}\")\n            raise e\n\n    if not isinstance(df.index, pd.DatetimeIndex):\n        df.index = pd.to_datetime(df.index)\n\n    for col in df.columns:\n        df[col] = pd.to_numeric(df[col], errors='coerce')\n\n    df = df.ffill().bfill()\n    df = df[~df.index.duplicated(keep='first')]\n    return df.sort_index()\n\n\n# ==========================================\n# 4. CUSTOM BACKTEST ENGINE\n# ==========================================\n\nclass Position:\n    def __init__(self, size=0, entry_price=0, entry_time=None, is_long=True,\n                 tp_price=None, sl_price=None):\n        self.size        = size\n        self.entry_price = entry_price\n        self.entry_time  = entry_time\n        self.is_long     = is_long\n        self.is_short    = not is_long\n        self.tp_price    = tp_price   # None → no ATR/fixed TP\n        self.sl_price    = sl_price   # None → no ATR/fixed SL\n\n\nclass BaseStrategy:\n    def __init__(self, data, cash, commission, leverage):\n        self.data          = data\n        self.cash          = cash\n        self.commission    = commission\n        self.leverage      = leverage\n        self.position      = None\n        self.closed_pnls   = []\n        self.trade_history = []\n\n        if len(data) > 1:\n            self._candle_duration = data.index[1] - data.index[0]\n        else:\n            self._candle_duration = pd.Timedelta(hours=1)\n\n    def buy(self, size=0.99, tp_price=None, sl_price=None):\n        if self.position: return\n        entry_t       = self.data.index[-1] + self._candle_duration\n        self.position = Position(size=size,\n                                 entry_price=self.data['close'].iloc[-1],\n                                 entry_time=entry_t,\n                                 is_long=True,\n                                 tp_price=tp_price,\n                                 sl_price=sl_price)\n\n    def sell(self, size=0.99, tp_price=None, sl_price=None):\n        if self.position: return\n        entry_t       = self.data.index[-1] + self._candle_duration\n        self.position = Position(size=size,\n                                 entry_price=self.data['close'].iloc[-1],\n                                 entry_time=entry_t,\n                                 is_long=False,\n                                 tp_price=tp_price,\n                                 sl_price=sl_price)\n\n    def _close_position(self, current_price, reason=\"Manual\", exit_time=None):\n        if not self.position: return\n\n        entry_p = self.position.entry_price\n        entry_t = self.position.entry_time\n        exit_t  = exit_time if exit_time is not None else self.data.index[-1] + self._candle_duration\n        is_long = self.position.is_long\n\n        pnl_pct       = (current_price - entry_p) / entry_p if is_long \\\n                        else (entry_p - current_price) / entry_p\n        leveraged_pnl = pnl_pct * self.leverage\n        final_pnl     = leveraged_pnl - (self.commission * 2 * self.leverage)\n\n        self.closed_pnls.append(final_pnl)\n        if not hasattr(self, 'trade_history'): self.trade_history = []\n        self.trade_history.append({\n            'entry_time':  entry_t,\n            'exit_time':   exit_t,\n            'type':        'LONG' if is_long else 'SHORT',\n            'entry_price': entry_p,\n            'exit_price':  current_price,\n            'pnl':         final_pnl,\n            'reason':      reason\n        })\n        self.position = None\n\n\nclass Backtest:\n    def __init__(self, data, strategy_class, data_1h=None, cash=10000, commission=0,\n                 margin=1.0, trade_on_close=True, finalize_trades=True):\n        self.data            = data\n        self.data_1h         = data_1h\n        self.strategy_class  = strategy_class\n        self.cash            = cash\n        self.commission      = commission\n        self.margin          = margin\n        self.leverage        = round(1.0 / margin) if margin > 0 else 1\n        self.finalize_trades = finalize_trades\n\n    def run(self, **kwargs):\n        strategy         = self.strategy_class(self.data, self.cash, self.commission, self.leverage)\n        strategy.data_1h = self.data_1h\n        for k, v in kwargs.items():\n            setattr(strategy, k, v)\n\n        strategy.init()\n\n        for i in range(2, len(self.data) + 1):\n            strategy.data = self.data.iloc[:i]\n            if len(strategy.data) > 1:\n                strategy._candle_duration = strategy.data.index[1] - strategy.data.index[0]\n            strategy.next()\n\n        if self.finalize_trades and strategy.position:\n            strategy._close_position(self.data['close'].iloc[-1], reason=\"Finalize\")\n\n        total_val = self.cash\n        for p in strategy.closed_pnls:\n            total_val *= (1 + p)\n        final_return = ((total_val / self.cash) - 1) * 100\n\n        pnls          = strategy.closed_pnls\n        wins          = [p for p in pnls if p > 0]\n        losses        = [p for p in pnls if p < 0]\n        win_rate      = (len(wins) / len(pnls) * 100) if pnls else 0\n        gross_profit  = sum(wins)\n        gross_loss    = abs(sum(losses))\n        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (10.0 if gross_profit > 0 else 0)\n\n        std_pnl = np.std(pnls, ddof=1) if len(pnls) > 1 else 0\n        sharpe  = (np.mean(pnls) / std_pnl) * np.sqrt(365) if std_pnl > 1e-9 else 0\n\n        if pnls:\n            cum_ret = np.cumprod([1 + p for p in pnls])\n            peak    = np.maximum.accumulate(cum_ret)\n            mdd     = float(np.min((cum_ret - peak) / peak) * 100)\n        else:\n            mdd = 0.0\n\n        return {\n            'Return [%]':       final_return,\n            '# Trades':         len(pnls),\n            'Win Rate [%]':     win_rate,\n            'Profit Factor':    profit_factor,\n            'Sharpe Ratio':     sharpe,\n            'Max Drawdown [%]': mdd,\n            'History':          getattr(strategy, 'trade_history', [])\n        }\n\n\n# ==========================================\n# 5. STRATEGY ENGINE\n# ==========================================\nclass MyStrategy(BaseStrategy):\n    mode           = 'both'\n    verbose        = False\n    data_1h        = None\n    ALLOW_FLIPPING = True\n    config         = None   # set to TemplateConfig instance before running\n\n    def init(self):\n        self.entry_price = 0\n        self.entry_bar   = 0\n        self.processed_timestamps = set()\n\n    # ── Hard error on missing / non-numeric column ─────────────────────\n    def _get_val(self, row, key, is_price=False):\n        val = row.get(key, None)\n        if val is None:\n            if is_price:\n                return float(row['close'])\n            raise ValueError(\n                f\"[FATAL] Column '{key}' is MISSING at {self.data.index[-1]}.\\n\"\n                f\"Available columns: {sorted(row.index.tolist())}\"\n            )\n        try:\n            result = float(val)\n            if np.isnan(result):\n                if is_price:\n                    return float(row['close'])\n                raise ValueError(\n                    f\"[FATAL] Column '{key}' is NaN at {self.data.index[-1]}. \"\n                    f\"Check your data pipeline.\"\n                )\n            return result\n        except (ValueError, TypeError) as e:\n            if is_price:\n                return float(row['close'])\n            raise ValueError(\n                f\"[FATAL] Column '{key}' has non-numeric value '{val}' \"\n                f\"at {self.data.index[-1]}. Error: {e}\"\n            )\n\n    # ── Compute TP and SL absolute prices at entry ─────────────────────\n    def _compute_tp_sl(self, entry_price, atr_value, is_long):\n        \"\"\"\n        Returns (tp_price, sl_price). Either can be None if not configured.\n        ATR-based takes priority over fixed-pct.\n        \"\"\"\n        cfg = self.config\n        tp  = None\n        sl  = None\n\n        if cfg.TP_ATR_MULT is not None:\n            tp = entry_price + cfg.TP_ATR_MULT * atr_value if is_long \\\n                 else entry_price - cfg.TP_ATR_MULT * atr_value\n        elif cfg.TP_PCT is not None:\n            tp = entry_price * (1 + cfg.TP_PCT) if is_long \\\n                 else entry_price * (1 - cfg.TP_PCT)\n\n        if cfg.SL_ATR_MULT is not None:\n            sl = entry_price - cfg.SL_ATR_MULT * atr_value if is_long \\\n                 else entry_price + cfg.SL_ATR_MULT * atr_value\n        elif cfg.SL_PCT is not None:\n            sl = entry_price * (1 - cfg.SL_PCT) if is_long \\\n                 else entry_price * (1 + cfg.SL_PCT)\n\n        return tp, sl\n\n    # ── Scan 1H sub-candles for first TP/SL breach ────────────────────\n    def _check_tpsl_on_1h(self, bar_start, bar_end, is_long, tp_price, sl_price):\n        \"\"\"\n        Iterates 1H candles inside [bar_start, bar_end) in time order.\n        Returns (hit, exit_price, exit_time, reason) or (False, None, None, None).\n\n        Same-candle both breach → SL wins (conservative).\n        \"\"\"\n        if self.data_1h is None:\n            return False, None, None, None\n\n        sub = self.data_1h[\n            (self.data_1h.index >= bar_start) &\n            (self.data_1h.index <  bar_end)\n        ].sort_index()\n\n        for t_sub, r_sub in sub.iterrows():\n            h = float(r_sub['high'])\n            l = float(r_sub['low'])\n\n            if is_long:\n                sl_hit = (sl_price is not None) and (l <= sl_price)\n                tp_hit = (tp_price is not None) and (h >= tp_price)\n            else:\n                sl_hit = (sl_price is not None) and (h >= sl_price)\n                tp_hit = (tp_price is not None) and (l <= tp_price)\n\n            if sl_hit and tp_hit:   # same candle → SL wins\n                return True, sl_price, t_sub, \"SL Hit\"\n            if sl_hit:\n                return True, sl_price, t_sub, \"SL Hit\"\n            if tp_hit:\n                return True, tp_price, t_sub, \"TP Hit\"\n\n        return False, None, None, None\n\n    # ── Main per-bar logic ─────────────────────────────────────────────\n    def next(self):\n        current_time  = self.data.index[-1]\n        current_price = self.data['close'].iloc[-1]\n\n        if current_time in self.processed_timestamps:\n            return\n        self.processed_timestamps.add(current_time)\n\n        if is_downtime(current_time):\n            if self.position:\n                self._close_position(current_price, reason=\"Downtime\",\n                                     exit_time=current_time + self._candle_duration)\n            return\n\n        row = self.data.iloc[-1]\n        get = lambda key, is_price=False: self._get_val(row, key, is_price)\n\n        # Read all indicator values — raises immediately if any column missing\n        rsi_value       = get('rsi_value')\n        stoch_K         = get('stoch_k')\n        adosc_value     = get('adosc_value')\n        price_value     = get('price_value', True)   # falls back to close\n        hma_value       = get('hma_value')\n        dpo_value       = get('dpo_value')\n        psar_value      = get('psar_value')\n        atr_value       = get('atr_value')\n        dmi_minusdi     = get('dmi_minusdi')\n        aroon_AroonDown = get('aroon_aroondown')\n        vortex_minus    = get('vortex_minus')\n        adx_value       = get('adx_value')\n        cmf_value       = get('cmf_value')\n\n        # ── EXIT LOGIC ─────────────────────────────────────────────────\n        if self.position:\n            tp_price = self.position.tp_price\n            sl_price = self.position.sl_price\n            has_tpsl = (tp_price is not None) or (sl_price is not None)\n\n            bar_start = current_time\n            bar_end   = current_time + self._candle_duration\n\n            # ── CASE A: scan 1H sub-candles for TP/SL breach ─────────\n            # Only runs when at least one of TP or SL is configured.\n            # Uses exit table (1H) high/low — no indicator columns needed.\n            tpsl_hit        = False\n            tpsl_exit_price = None\n            tpsl_exit_time  = None\n            tpsl_reason     = None\n\n            if has_tpsl:\n                tpsl_hit, tpsl_exit_price, tpsl_exit_time, tpsl_reason = \\\n                    self._check_tpsl_on_1h(\n                        bar_start, bar_end,\n                        self.position.is_long,\n                        tp_price, sl_price\n                    )\n\n            # ── CASE B: indicator-based exit on 4H close ─────────────\n            # Always evaluated using main table indicators at bar close.\n            # Runs regardless of whether TP/SL is configured.\n            indicator_exit   = False\n            indicator_reason = None\n\n            if self.position.is_long:\n                entry_p = self.position.entry_price\n                if (price_value <= entry_p - 1.5 * atr_value) or \\\n                   (price_value < psar_value) or \\\n                   (rsi_value < 50) or \\\n                   (stoch_K < 40):\n                    indicator_exit   = True\n                    indicator_reason = \"Exit Long Signal\"\n            else:\n                entry_p = self.position.entry_price\n                if (price_value >= entry_p + 1.5 * atr_value) or \\\n                   (price_value > hma_value) or \\\n                   (dpo_value > 0) or \\\n                   (cmf_value > 0):\n                    indicator_exit   = True\n                    indicator_reason = \"Exit Short Signal\"\n\n            # ── Resolve: whichever fires first wins ───────────────────\n            #\n            # TP/SL is checked on 1H sub-candles WITHIN the current 4H bar\n            # → if it fires, it happened BEFORE the 4H close.\n            # Indicator exit is checked at the 4H close.\n            #\n            # Priority:\n            #   1. TP/SL hit on a 1H sub-candle  → TP/SL wins (fired mid-bar)\n            #   2. Indicator fires at 4H close    → indicator wins\n            #   3. Neither                        → hold position\n            #\n            # If both are defined and TP/SL was NOT hit during the bar\n            # but indicator fires at close → indicator exit is used.\n\n            closed = False\n\n            if tpsl_hit:\n                if self.verbose:\n                    print(f\"[{current_time}] {tpsl_reason} @ {tpsl_exit_price:.2f} \"\n                          f\"(1H candle: {tpsl_exit_time})\")\n                self._close_position(tpsl_exit_price,\n                                     reason=tpsl_reason,\n                                     exit_time=tpsl_exit_time)\n                closed = True\n\n            elif indicator_exit:\n                if self.verbose:\n                    print(f\"[{current_time}] {indicator_reason} @ {current_price:.2f}\")\n                self._close_position(current_price,\n                                     reason=indicator_reason,\n                                     exit_time=bar_end)\n                closed = True\n\n            if closed and not self.ALLOW_FLIPPING:\n                return\n\n        # ── ENTRY LOGIC ────────────────────────────────────────────────\n        is_long_signal  = False\n        is_short_signal = False\n\n        if (rsi_value > 65) and (stoch_K > 75) and (adosc_value > 5000) and \\\n           (price_value > hma_value) and (dpo_value > 0) and (psar_value < price_value):\n            is_long_signal = True\n\n        if (dmi_minusdi > 25) and (aroon_AroonDown > 70) and \\\n           (vortex_minus > 1.1) and (adx_value > 25):\n            is_short_signal = True\n\n        if not self.position:\n            if self.mode in ['both', 'long'] and is_long_signal:\n                tp, sl = self._compute_tp_sl(price_value, atr_value, is_long=True)\n                self.buy(size=0.99, tp_price=tp, sl_price=sl)\n                self.entry_price = price_value\n                self.entry_bar   = len(self.data)\n                if self.verbose:\n                    print(f\"[{current_time}] LONG Entry @ {price_value:.2f} \"\n                          f\"| TP={tp} SL={sl}\")\n\n            elif self.mode in ['both', 'short'] and is_short_signal:\n                tp, sl = self._compute_tp_sl(price_value, atr_value, is_long=False)\n                self.sell(size=0.99, tp_price=tp, sl_price=sl)\n                self.entry_price = price_value\n                self.entry_bar   = len(self.data)\n                if self.verbose:\n                    print(f\"[{current_time}] SHORT Entry @ {price_value:.2f} \"\n                          f\"| TP={tp} SL={sl}\")\n\n\n# ==========================================\n# 6. OUTPUT HELPERS\n# ==========================================\n\ndef _bar(val, width=10):\n    filled = round(val / 100 * width)\n    return \"█\" * filled + \"░\" * (width - filled)\n\ndef print_summary_table(results_by_period):\n    COL_W   = [12, 7, 11, 5, 17, 6, 8, 7]\n    HEADERS = [\"Period\", \"Mode\", \"Return\", \"Trd\", \"Win Rate\", \"PF\", \"MDD%\", \"Sharpe\"]\n\n    sep        = \"+\" + \"+\".join(\"-\" * (w + 2) for w in COL_W) + \"+\"\n    header_row = \"|\" + \"|\".join(f\" {h:<{w}} \" for h, w in zip(HEADERS, COL_W)) + \"|\"\n\n    print()\n    print(\"=\" * (sum(COL_W) + len(COL_W) * 3 + 1))\n    print(\"  MARKET PHASE ADAPTIVE STRATEGY  —  Performance Report\")\n    print(\"=\" * (sum(COL_W) + len(COL_W) * 3 + 1))\n    print(sep)\n    print(header_row)\n    print(sep.replace(\"-\", \"=\"))\n\n    prev_period = None\n    for row in results_by_period:\n        period   = row['period']\n        mode     = row['mode']\n        stats    = row['stats']\n        ret      = stats['Return [%]']\n        n_trades = stats['# Trades']\n        win_rate = stats['Win Rate [%]']\n        pf       = stats['Profit Factor']\n        sharpe   = stats['Sharpe Ratio']\n        mdd      = stats['Max Drawdown [%]']\n\n        period_label = period if period != prev_period else \"\"\n        ret_str  = f\"{ret:+.2f}%\"\n        wr_str   = f\"{win_rate:4.1f}%  {_bar(win_rate, 8)}\"\n        pf_str   = f\"{pf:.2f}\"\n        mdd_str  = f\"{mdd:.2f}%\"\n        sh_str   = f\"{sharpe:+.2f}\"\n\n        mode_display = {\"both\": \"Both\", \"long\": \"Long ↑\", \"short\": \"Short ↓\"}.get(mode, mode)\n\n        cells = [\n            f\"{period_label:<{COL_W[0]}}\",\n            f\"{mode_display:<{COL_W[1]}}\",\n            f\"{ret_str:>{COL_W[2]}}\",\n            f\"{n_trades:>{COL_W[3]}}\",\n            f\"{wr_str:<{COL_W[4]}}\",\n            f\"{pf_str:>{COL_W[5]}}\",\n            f\"{mdd_str:>{COL_W[6]}}\",\n            f\"{sh_str:>{COL_W[7]}}\",\n        ]\n        print(\"|\" + \"|\".join(f\" {c} \" for c in cells) + \"|\")\n\n        prev_period = period\n        if mode == 'short':\n            print(sep)\n\n    print()\n\n\ndef print_trade_history(label, trades):\n    COL_W   = [18, 18, 6, 10, 10, 9, 20]\n    HEADERS = [\"Entry Time\", \"Exit Time\", \"Type\", \"Entry\", \"Exit\", \"PnL %\", \"Reason\"]\n\n    sep        = \"+\" + \"+\".join(\"-\" * (w + 2) for w in COL_W) + \"+\"\n    header_row = \"|\" + \"|\".join(f\" {h:<{w}} \" for h, w in zip(HEADERS, COL_W)) + \"|\"\n\n    print()\n    print(f\"  Trade History — {label}\")\n    print(sep)\n    print(header_row)\n    print(sep.replace(\"-\", \"=\"))\n\n    for t in trades:\n        entry_t = t['entry_time']\n        exit_t  = t['exit_time']\n        e_str   = entry_t.strftime('%Y-%m-%d %H:%M') if hasattr(entry_t, 'strftime') else str(entry_t)\n        x_str   = exit_t.strftime('%Y-%m-%d %H:%M')  if hasattr(exit_t,  'strftime') else str(exit_t)\n        pnl_str = f\"{t['pnl']*100:+.2f}%\"\n        reason  = t['reason'][:20]\n\n        cells = [\n            f\"{e_str:<{COL_W[0]}}\",\n            f\"{x_str:<{COL_W[1]}}\",\n            f\"{t['type']:<{COL_W[2]}}\",\n            f\"{t['entry_price']:>{COL_W[3]}.2f}\",\n            f\"{t['exit_price']:>{COL_W[4]}.2f}\",\n            f\"{pnl_str:>{COL_W[5]}}\",\n            f\"{reason:<{COL_W[6]}}\",\n        ]\n        print(\"|\" + \"|\".join(f\" {c} \" for c in cells) + \"|\")\n\n    print(sep)\n    print(f\"  Total trades: {len(trades)}\")\n    print()\n\n\n# ==========================================\n# ==========================================\n# 7. MAIN\n# ==========================================\ndef main():\n    parser = argparse.ArgumentParser(description=\"Market Phase Adaptive Strategy\")\n    parser.add_argument(\"--table\",      type=str,   default=\"ETH_4H_TAAPI_Indicator_snapshot\")\n    parser.add_argument(\"--exit_table\", type=str,   default=\"ETH_1H_TAAPI_Indicator_snapshot\")\n    parser.add_argument(\"--cash\",       type=float, default=1000000)\n    parser.add_argument(\"--commission\", type=float, default=0.0003)\n    parser.add_argument(\"--margin\",     type=float, default=0.33)\n    parser.add_argument(\"--tp_atr\",     type=float, default=None, help=\"TP as ATR multiplier e.g. 3.0\")\n    parser.add_argument(\"--sl_atr\",     type=float, default=None, help=\"SL as ATR multiplier e.g. 1.5\")\n    parser.add_argument(\"--tp_pct\",     type=float, default=None, help=\"TP as fixed pct e.g. 0.03\")\n    parser.add_argument(\"--sl_pct\",     type=float, default=None, help=\"SL as fixed pct e.g. 0.015\")\n    parser.add_argument(\"--verbose\",    action=\"store_true\", help=\"Show per-signal entry/exit logs\")\n    args = parser.parse_args()\n\n    config                 = TemplateConfig()\n    config.TABLE_NAME      = args.table\n    config.EXIT_TABLE_NAME = args.exit_table\n    config.CASH            = args.cash\n    config.COMMISSION      = args.commission\n    config.MARGIN          = args.margin\n    config.TP_ATR_MULT     = args.tp_atr\n    config.SL_ATR_MULT     = args.sl_atr\n    config.TP_PCT          = args.tp_pct\n    config.SL_PCT          = args.sl_pct\n\n    needed_cols = [\n        'open', 'high', 'low', 'close', 'volume', 'timestamp',\n        'rsi_value', 'stoch_k', 'adosc_value', 'price_value',\n        'hma_value', 'dpo_value', 'psar_value', 'atr_value',\n        'dmi_minusdi', 'aroon_aroondown', 'vortex_minus',\n        'adx_value', 'cmf_value'\n    ]\n\n    try:\n        df = load_data(config, needed_cols)\n    except Exception as e:\n        print(f\"Error loading main data: {e}\")\n        return\n\n    try:\n        df_1h = load_data(config, ['open', 'high', 'low', 'close', 'timestamp'],\n                          table_name=config.EXIT_TABLE_NAME)\n    except Exception as e:\n        print(f\"Warning: Could not load exit table: {e}. TP/SL sub-candle tracking disabled.\")\n        df_1h = None\n\n    if df.empty or len(df) < 2:\n        print(\"Error: Insufficient data.\")\n        return\n\n    MyStrategy.verbose = args.verbose\n    MyStrategy.config  = config\n\n    # ✅ Added 3 Months here\n    periods = {\n        '6 Months': pd.Timedelta(days=180),\n        '3 Months': pd.Timedelta(days=90),\n        '1 Month':  pd.Timedelta(days=30),\n        '1 Week':   pd.Timedelta(days=7),\n        '1 Day':    pd.Timedelta(days=1),\n    }\n\n    last_dt = df.index[-1]\n    modes   = ['both', 'long', 'short']\n\n    results_by_period = []\n    trade_history_6m  = None   # ✅ changed from 1m to 6m\n\n    print(\"\\nRunning backtests...\\n\")\n    tpsl_mode = []\n    if config.TP_ATR_MULT: tpsl_mode.append(f\"TP={config.TP_ATR_MULT}×ATR\")\n    if config.SL_ATR_MULT: tpsl_mode.append(f\"SL={config.SL_ATR_MULT}×ATR\")\n    if config.TP_PCT:      tpsl_mode.append(f\"TP={config.TP_PCT*100:.1f}%\")\n    if config.SL_PCT:      tpsl_mode.append(f\"SL={config.SL_PCT*100:.1f}%\")\n\n    print(f\"TP/SL config : {', '.join(tpsl_mode) if tpsl_mode else 'None (indicator exits only)'}\")\n    print(f\"Exit table   : {config.EXIT_TABLE_NAME if df_1h is not None else 'Not loaded'}\\n\")\n\n    for label, delta in periods.items():\n        start_dt  = last_dt - delta\n        sliced_df = df[df.index >= start_dt]\n\n        if sliced_df.empty or len(sliced_df) < 2:\n            print(f\"Skipping {label}: insufficient data after slicing.\")\n            continue\n\n        for mode in modes:\n            MyStrategy.mode = mode\n            bt = Backtest(\n                sliced_df, MyStrategy, data_1h=df_1h,\n                cash=config.CASH,\n                commission=config.COMMISSION,\n                margin=config.MARGIN\n            )\n            stats = bt.run()\n\n            results_by_period.append({\n                'period': label,\n                'mode': mode,\n                'stats': stats\n            })\n\n            # ✅ Store 6 Month trade history instead of 1 Month\n            if label == '6 Months' and mode == 'both':\n                trade_history_6m = stats['History']\n\n    print_summary_table(results_by_period)\n\n    # ✅ Print 6 Month trades\n    if trade_history_6m is not None:\n        print_trade_history(\"6 Months  (mode=both)\", trade_history_6m)\n\n\nif __name__ == \"__main__\":\n    main()",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        208,
+        -16
+      ],
+      "id": "92fa62cd-b473-45fd-9abb-2f6dbbf228d7",
+      "name": "AI Agent",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Session ID Generator').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        304,
+        192
+      ],
+      "id": "a40d88d4-44c6-4501-8438-ab0faf35b8df",
+      "name": "Redis Chat Memory",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate UUID v4 style random ID\nfunction generateUUID() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\n// Get all incoming items\nconst items = $input.all();\n\n// Map and preserve previous JSON\nreturn items.map(item => {\n  return {\n    json: {\n      ...item.json,          // 🔥 keep previous node data\n      sessionId: generateUUID()  // add new field\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        -16
+      ],
+      "id": "87aa694e-42e9-4946-a473-278a5dbb40c1",
+      "name": "Session ID Generator"
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        400,
+        176
+      ],
+      "id": "7d0f8573-6953-46f3-bf9f-089e1e830cc4",
+      "name": "Structured Output Parser1"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        720,
+        -16
+      ],
+      "id": "a9cb670a-76c8-4838-bfc5-9e05c2efd242",
+      "name": "Execute a command",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=I faced issue  - {{ $('Execute a command4').item.json.stderr }}\n\nMy python code - {{ $('AI Agent').item.json.output.new_python_code }}",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1744,
+        0
+      ],
+      "id": "cd5766ee-b5ae-49a9-ba51-3fc72da8c3b6",
+      "name": "AI Agent1",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Create Command Line3').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        1840,
+        224
+      ],
+      "id": "dcf0841c-855b-4359-8408-ffe4096ad6f8",
+      "name": "Redis Chat Memory1",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1616,
+        224
+      ],
+      "id": "b554e95e-310e-4fcc-a77f-85889f803d34",
+      "name": "Google Gemini Chat Model2",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1728,
+        224
+      ],
+      "id": "1ef73284-8dcb-460e-bb21-e563f1c92623",
+      "name": "Google Gemini Chat Model3",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1936,
+        224
+      ],
+      "id": "d0c5f401-fc38-40d2-9199-0f4400786a9a",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n  --cash 100000 \\\n  --commission 0.0003 \\\n  --margin 0.33 \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        896,
+        -16
+      ],
+      "id": "8ffc80a4-9a93-42e7-81e8-2b5b77d26633",
+      "name": "Execute a command4",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            },
+            {
+              "id": "55b57c75-594a-46ae-91f2-7bb8b02faf48",
+              "name": "extra field",
+              "value": "  --cash 100000 \\\n  --commission 0.0003 \\\n  --margin 0.33",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        560,
+        -16
+      ],
+      "id": "a2a79357-795f-4eef-8d46-fa71fe047f8c",
+      "name": "Create Command Line3"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2128,
+        0
+      ],
+      "id": "43509c2e-ff56-4c89-9c13-cb0983d01d07",
+      "name": "Create Command Line"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2368,
+        0
+      ],
+      "id": "40ea5e00-1bd9-4314-a33a-69f8afc51694",
+      "name": "Execute a command5",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2544,
+        0
+      ],
+      "id": "ab15fdf4-48f7-44e6-b330-c63aee8d1fd5",
+      "name": "Execute a command6",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=My initial Entry Exit logic to implement in code was - \nEntry Long - {{ $item(\"0\").$node[\"When Executed by Another Workflow\"].json[\"Entry Long\"] }}\nExit Long - {{ $item(\"0\").$node[\"When Executed by Another Workflow\"].json[\"Exit Long\"] }}\nEntry Short - {{ $item(\"0\").$node[\"When Executed by Another Workflow\"].json[\"Entry Short\"] }}\nExit Short - {{ $item(\"0\").$node[\"When Executed by Another Workflow\"].json[\"Exit Short\"] }}\n\nNew issue i faced  - {{ $('Execute a command6').item.json.stderr }}/null\n\nPlease fix all issues at once.\nCode to fix - {{ $('AI Agent1').item.json.output.new_python_code }}",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        3504,
+        -16
+      ],
+      "id": "aa845695-dd27-46de-9b64-60777332697c",
+      "name": "AI Agent2",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Create Command Line3').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        3600,
+        208
+      ],
+      "id": "7b96dd66-dd85-44aa-a0ae-83452bff9472",
+      "name": "Redis Chat Memory2",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        3376,
+        208
+      ],
+      "id": "9be4a4c2-94da-4786-840a-5f2227177f15",
+      "name": "Google Gemini Chat Model4",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        3520,
+        352
+      ],
+      "id": "08fd8905-11bf-49d6-8c89-af1d1288aebd",
+      "name": "Google Gemini Chat Model5",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        3696,
+        208
+      ],
+      "id": "a26b7719-94a0-4d15-a4c0-542ddab09b78",
+      "name": "Structured Output Parser2"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3888,
+        -16
+      ],
+      "id": "1e7e0ea9-9663-494a-b708-87e2c259f4b5",
+      "name": "Create Command Line1"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        4128,
+        -16
+      ],
+      "id": "f91862cf-8a06-484d-9404-3ad4959a6c29",
+      "name": "Execute a command7",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        4304,
+        -16
+      ],
+      "id": "9ff7c24a-338f-4765-81dd-ec837b431493",
+      "name": "Execute a command8",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=I faced issue  - \n{{ $('Execute a command8').item.json.stderr }}\n\nRe create entire code from scratch , it is making a lot of issues, \nCode to fix - {{ $('AI Agent2').item.json.output.new_python_code }}",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        5440,
+        -32
+      ],
+      "id": "d2d16fcb-3030-418d-b76e-81f0b33b6ba9",
+      "name": "AI Agent3",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Create Command Line3').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        5536,
+        192
+      ],
+      "id": "fab22275-7990-4cd2-85fe-d3dcce2fcf70",
+      "name": "Redis Chat Memory3",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        5312,
+        192
+      ],
+      "id": "1ad8cf3a-d9f3-42cc-a4e1-46fe8c77c542",
+      "name": "Google Gemini Chat Model6",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        5424,
+        192
+      ],
+      "id": "47ae0d93-145f-408a-a3c7-6e12c64e302d",
+      "name": "Google Gemini Chat Model7",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        5632,
+        192
+      ],
+      "id": "414448f3-bd0b-4166-b231-4cd75db54a21",
+      "name": "Structured Output Parser3"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5824,
+        -32
+      ],
+      "id": "cd58fdce-ad62-4213-b211-228cd13a9699",
+      "name": "Create Command Line2"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        6064,
+        -32
+      ],
+      "id": "76336a6c-dab8-439b-aa45-0484fac9cd40",
+      "name": "Execute a command9",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        6240,
+        -32
+      ],
+      "id": "81cea40a-4294-4f9d-a2db-5ce314330879",
+      "name": "Execute a command10",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Get the input and decide weather this is a error output or not?\n\nIf output is correct valid backtesting result containng trades and returns parse testing:true/false. {{ $json.stdout }}\n\n{{ $json.stderr }}\n\nIf data is valid testing:true  arrange them into 2 section - 1st is for Trade History and 2nd is For Strategy Performance. \nPass Data in proper csv format. \nAvoid any rought Data parse exactly csv format in output.\n",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1168,
+        -400
+      ],
+      "id": "911b661d-5ad3-401c-84e2-4ebfbd5f6cd2",
+      "name": "AI Agent4",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1104,
+        -160
+      ],
+      "id": "7feb219d-565c-45a8-b8b4-31c8de0b262c",
+      "name": "Google Gemini Chat Model8",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1232,
+        -160
+      ],
+      "id": "cb593fa8-f862-4a82-8914-b47c449d8326",
+      "name": "Google Gemini Chat Model9",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"testing\": \"string\",\n  \"Trade_records\": \"Entry Time,Exit Time,Type,Entry,Exit,PnL%,Reason\",\n\t\"Performance\": \"Period,Mode,Return,Trd,Win%,PF,Sharpe\",\n\t\"raw\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1440,
+        -160
+      ],
+      "id": "02e09b65-99a3-4791-85f0-514b673fe3c3",
+      "name": "Structured Output Parser4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68e349da-c9a2-4f19-99d6-16038aa8138f",
+              "leftValue": "={{ $json.output.testing }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1488,
+        -400
+      ],
+      "id": "22e63df3-1b97-4f6e-899d-8e60941aae4c",
+      "name": "If3"
+    },
+    {
+      "parameters": {
+        "tableId": "BACKTESTING CORE",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "LONG_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Long'] }}"
+            },
+            {
+              "fieldId": "LONG_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Long'] }}"
+            },
+            {
+              "fieldId": "SHORT_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Short'] }}"
+            },
+            {
+              "fieldId": "SHORT_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Short'] }}"
+            },
+            {
+              "fieldId": "Strategy_Name",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Table Name'] }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.output.Trade_records }}"
+            },
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.output.Performance }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        -416
+      ],
+      "id": "409a7b0a-c08b-477f-9ced-928ecfb5c9ac",
+      "name": "Create a row2",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Get the input and decide weather this is a error output or not?\n\nIf output is correct valid backtesting result containng trades and returns parse testing:true/false. {{ $json.stdout }}\n\n{{ $json.stderr }}\n\nIf data is valid testing:true  arrange them into 2 section - 1st is for Trade History and 2nd is For Strategy Performance. \nPass Data in proper csv format. \nAvoid any rought Data parse exactly csv format in output.\n",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        2816,
+        -352
+      ],
+      "id": "ba88a3e6-3ec6-4622-9edf-a17d61734fb7",
+      "name": "AI Agent5",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2704,
+        -112
+      ],
+      "id": "4c7a1e2c-6689-4861-b568-1d456057670a",
+      "name": "Google Gemini Chat Model10",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2800,
+        -112
+      ],
+      "id": "98ac48da-1df9-4145-843d-18bc778ce70e",
+      "name": "Google Gemini Chat Model11",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"testing\": \"string\",\n  \"Trade_records\": \"Entry Time,Exit Time,Type,Entry,Exit,PnL%,Reason\",\n\t\"Performance\": \"Period,Mode,Return,Trd,Win%,PF,Sharpe\",\n\t\"raw\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        3008,
+        -112
+      ],
+      "id": "2704c585-a75a-4f75-813c-200b439652af",
+      "name": "Structured Output Parser5"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68e349da-c9a2-4f19-99d6-16038aa8138f",
+              "leftValue": "={{ $json.output.testing }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3168,
+        -352
+      ],
+      "id": "58cffab0-5c27-41aa-8243-e08a4daa84db",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "tableId": "BACKTESTING CORE",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "LONG_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Long'] }}"
+            },
+            {
+              "fieldId": "LONG_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Long'] }}"
+            },
+            {
+              "fieldId": "SHORT_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Short'] }}"
+            },
+            {
+              "fieldId": "SHORT_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Short'] }}"
+            },
+            {
+              "fieldId": "Strategy_Name",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Table Name'] }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.output.Trade_records }}"
+            },
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.output.Performance }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3408,
+        -368
+      ],
+      "id": "d537f534-1b25-43c8-8d38-e0f374e07793",
+      "name": "Create a row",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Get the input and decide weather this is a error output or not?\n\nIf output is correct valid backtesting result containng trades and returns parse testing:true/false. {{ $json.stdout }}\n\n{{ $json.stderr }}\n\nIf data is valid testing:true  arrange them into 2 section - 1st is for Trade History and 2nd is For Strategy Performance. \nPass Data in proper csv format. \nAvoid any rought Data parse exactly csv format in output.\n",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        4624,
+        -384
+      ],
+      "id": "792496fc-d578-4709-9520-7f59d89a5979",
+      "name": "AI Agent6",
+      "retryOnFail": true,
+      "maxTries": 5
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        4512,
+        -144
+      ],
+      "id": "35f91a0b-6277-4352-8ae6-65abe7330f1d",
+      "name": "Google Gemini Chat Model12",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        4608,
+        -144
+      ],
+      "id": "f9ee6c4e-9b77-48cd-bd29-4cb50fec6f1c",
+      "name": "Google Gemini Chat Model13",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"testing\": \"string\",\n  \"Trade_records\": \"Entry Time,Exit Time,Type,Entry,Exit,PnL%,Reason\",\n\t\"Performance\": \"Period,Mode,Return,Trd,Win%,PF,Sharpe\",\n\t\"raw\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        4816,
+        -144
+      ],
+      "id": "7a674a91-37e1-4acb-9c11-09a44812fe10",
+      "name": "Structured Output Parser6"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68e349da-c9a2-4f19-99d6-16038aa8138f",
+              "leftValue": "={{ $json.output.testing }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4976,
+        -384
+      ],
+      "id": "54771ad9-248f-4a38-8131-9d647c509b2c",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "tableId": "BACKTESTING CORE",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "LONG_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Long'] }}"
+            },
+            {
+              "fieldId": "LONG_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Long'] }}"
+            },
+            {
+              "fieldId": "SHORT_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Short'] }}"
+            },
+            {
+              "fieldId": "SHORT_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Short'] }}"
+            },
+            {
+              "fieldId": "Strategy_Name",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Table Name'] }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.output.Trade_records }}"
+            },
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.output.Performance }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5216,
+        -400
+      ],
+      "id": "d5bc7618-14ee-410c-8e98-da035567f024",
+      "name": "Create a row1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Get the input and decide weather this is a error output or not?\n\nIf output is correct valid backtesting result containng trades and returns parse testing:true/false. {{ $json.stdout }}\n\n{{ $json.stderr }}\n\nIf data is valid testing:true  arrange them into 2 section - 1st is for Trade History and 2nd is For Strategy Performance. \nPass Data in proper csv format. \nAvoid any rought Data parse exactly csv format in output.\n",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        6608,
+        -496
+      ],
+      "id": "8e4e05f1-ff2e-48d6-8562-30d1d68acac0",
+      "name": "AI Agent7",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        6496,
+        -256
+      ],
+      "id": "40ea299a-3b94-4897-b6e7-97cda4d319fd",
+      "name": "Google Gemini Chat Model14",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        6592,
+        -256
+      ],
+      "id": "2bd5eef1-332c-42ff-9bf8-cdf9890e1ccc",
+      "name": "Google Gemini Chat Model15",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"testing\": \"string\",\n  \"Trade_records\": \"Entry Time,Exit Time,Type,Entry,Exit,PnL%,Reason\",\n\t\"Performance\": \"Period,Mode,Return,Trd,Win%,PF,Sharpe\",\n\t\"raw\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        6800,
+        -256
+      ],
+      "id": "36beaaae-1263-4f28-bb38-1de9f8639565",
+      "name": "Structured Output Parser7"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68e349da-c9a2-4f19-99d6-16038aa8138f",
+              "leftValue": "={{ $json.output.testing }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6960,
+        -496
+      ],
+      "id": "d3d18c19-34b0-48a7-807f-663384a18b45",
+      "name": "If4"
+    },
+    {
+      "parameters": {
+        "tableId": "BACKTESTING CORE",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "LONG_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Long'] }}"
+            },
+            {
+              "fieldId": "LONG_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Long'] }}"
+            },
+            {
+              "fieldId": "SHORT_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Short'] }}"
+            },
+            {
+              "fieldId": "SHORT_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Short'] }}"
+            },
+            {
+              "fieldId": "Strategy_Name",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Table Name'] }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.output.Trade_records }}"
+            },
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.output.Performance }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        7200,
+        -512
+      ],
+      "id": "34899887-7c6b-4caa-ad96-73800c227a8a",
+      "name": "Create a row3",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "Entry Long"
+            },
+            {
+              "name": "Exit Long"
+            },
+            {
+              "name": "Entry Short"
+            },
+            {
+              "name": "Exit Short"
+            },
+            {
+              "name": "Table Name"
+            },
+            {
+              "name": "Supporting Table"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -752,
+        -16
+      ],
+      "id": "33b96ade-ce47-4a32-9da9-47d72e78b50c",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=New issue i faced  - {{ $('Execute a command6').item.json.stderr }}\n\nPlease fix all issues at once.\nCode to fix - {{ $('AI Agent3').item.json.output.new_python_code }}",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        7264,
+        -128
+      ],
+      "id": "73edd359-5529-422e-835f-d2813e9b696c",
+      "name": "AI Agent8",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Create Command Line3').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        7360,
+        96
+      ],
+      "id": "67940e1b-e4de-451f-bf64-19e2aaa92d35",
+      "name": "Redis Chat Memory4",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        7456,
+        96
+      ],
+      "id": "80806e58-c78a-456f-8c22-79208087e442",
+      "name": "Structured Output Parser8"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        7648,
+        -128
+      ],
+      "id": "1c6cbd2a-9b9d-40b8-85d1-706d7ddb2e90",
+      "name": "Create Command Line4"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        7888,
+        -128
+      ],
+      "id": "930e2025-68f2-4289-b91b-a2ba3024b34e",
+      "name": "Execute a command11",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        8064,
+        -128
+      ],
+      "id": "40cba93e-7427-4844-b8ce-1f4d325c04a4",
+      "name": "Execute a command12",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=I faced issue  - \n{{ $('Execute a command12').item.json.stderr }}\n\nRe create entire code from scratch , it is making a lot of issues, \nCode to fix - {{ $('AI Agent8').item.json.output.new_python_code }}",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        9200,
+        -144
+      ],
+      "id": "2d816309-6728-41b3-bdb8-719de43074e5",
+      "name": "AI Agent9",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Create Command Line3').item.json.sessionId }}",
+        "sessionTTL": 1200,
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        9296,
+        80
+      ],
+      "id": "428be656-29f9-4d82-9a5e-72e34ee27073",
+      "name": "Redis Chat Memory5",
+      "credentials": {
+        "redis": {
+          "id": "5qXp9irQR051nePA",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        9072,
+        80
+      ],
+      "id": "9327a81e-ba0d-49fd-88ea-cc5420e4f6ed",
+      "name": "Google Gemini Chat Model18",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        9184,
+        80
+      ],
+      "id": "3af08f2d-7106-425c-91de-4aa978c40efd",
+      "name": "Google Gemini Chat Model19",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"new_python_code\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        9392,
+        80
+      ],
+      "id": "2f5ab1e3-833a-4a6f-b824-01b7a04e4de5",
+      "name": "Structured Output Parser9"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=cat << 'EOF' > 1.py\n{{ $json.output.new_python_code }}\nEOF",
+              "type": "string"
+            },
+            {
+              "id": "3d1f1d05-cea1-4352-ba5d-627037f1385b",
+              "name": "sessionId",
+              "value": "={{ $('Session ID Generator').item.json.sessionId }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        9584,
+        -144
+      ],
+      "id": "5f4fe25f-b735-456f-8eb9-1e0b1b83c766",
+      "name": "Create Command Line5"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.Setfield }}",
+        "cwd": "//home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        9824,
+        -144
+      ],
+      "id": "59c6c6d5-659d-404b-9f62-fe6102d7f380",
+      "name": "Execute a command13",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=python3 /home/contact/BackTesting/1.py \\\n  --table \"{{ $('When Executed by Another Workflow').item.json['Table Name'] }}_TAAPI_Indicator_snapshot\" \\\n  --exit_table \"{{ $('When Executed by Another Workflow').item.json['Supporting Table'] }}_TAAPI_Indicator_snapshot\" \\\n{{ $item(\"0\").$node[\"Create Command Line3\"].json[\"extra field\"] }}",
+        "cwd": "/home/contact/BackTesting/"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        10000,
+        -144
+      ],
+      "id": "22e6c129-7045-4ab3-be42-b98a3b4f57ed",
+      "name": "Execute a command14",
+      "credentials": {
+        "sshPassword": {
+          "id": "JqAzrb1tMA3JVtYj",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Get the input and decide weather this is a error output or not?\n\nIf output is correct valid backtesting result containng trades and returns parse testing:true/false. {{ $json.stdout }}\n\n{{ $json.stderr }}\n\nIf data is valid testing:true  arrange them into 2 section - 1st is for Trade History and 2nd is For Strategy Performance. \nPass Data in proper csv format. \nAvoid any rought Data parse exactly csv format in output.\n",
+        "hasOutputParser": true,
+        "needsFallback": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        8336,
+        -592
+      ],
+      "id": "ddadbfd8-4488-4b21-963c-6b211b7579c0",
+      "name": "AI Agent10",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-pro-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        8224,
+        -352
+      ],
+      "id": "df0e759b-9183-4b33-a70f-8f4351833684",
+      "name": "Google Gemini Chat Model20",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3-flash-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        8320,
+        -352
+      ],
+      "id": "471685ab-811e-495a-bac4-3e56f80b3bc2",
+      "name": "Google Gemini Chat Model21",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"testing\": \"string\",\n  \"Trade_records\": \"Entry Time,Exit Time,Type,Entry,Exit,PnL%,Reason\",\n\t\"Performance\": \"Period,Mode,Return,Trd,Win%,PF,Sharpe\",\n\t\"raw\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        8528,
+        -352
+      ],
+      "id": "fa05a82d-0221-448a-b58c-8e9046a87e00",
+      "name": "Structured Output Parser10"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "68e349da-c9a2-4f19-99d6-16038aa8138f",
+              "leftValue": "={{ $json.output.testing }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        8688,
+        -592
+      ],
+      "id": "e42602e4-ce0f-4d66-9ab6-efb73f41115a",
+      "name": "If5"
+    },
+    {
+      "parameters": {
+        "tableId": "BACKTESTING CORE",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "LONG_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Long'] }}"
+            },
+            {
+              "fieldId": "LONG_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Long'] }}"
+            },
+            {
+              "fieldId": "SHORT_entry_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Entry Short'] }}"
+            },
+            {
+              "fieldId": "SHORT_exit_logic",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Exit Short'] }}"
+            },
+            {
+              "fieldId": "Strategy_Name",
+              "fieldValue": "={{ $('When Executed by Another Workflow').item.json['Table Name'] }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.output.Trade_records }}"
+            },
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.output.Performance }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        8928,
+        -608
+      ],
+      "id": "68b75ae4-63f3-4e44-9ce8-34b355ad26f8",
+      "name": "Create a row4",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "throwErrorType": "Error"
+      },
+      "type": "n8n-nodes-base.debugHelper",
+      "typeVersion": 1,
+      "position": [
+        10208,
+        -144
+      ],
+      "id": "4a4f0f7d-c363-40ae-92c3-021589697cfc",
+      "name": "DebugHelper"
+    },
+    {
+      "parameters": {
+        "model": "minimax/minimax-m2.5",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        3248,
+        224
+      ],
+      "id": "b5366a2b-4738-4b20-bc15-0b9d17c1964d",
+      "name": "OpenRouter Chat Model",
+      "credentials": {
+        "openRouterApi": {
+          "id": "w0j9kgDCoFbv2Kn5",
+          "name": "OpenRouter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "minimax/minimax-m2.5",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        7216,
+        96
+      ],
+      "id": "581bfd0a-6b50-4e72-b7ce-ae90c379c5ec",
+      "name": "OpenRouter Chat Model1",
+      "credentials": {
+        "openRouterApi": {
+          "id": "w0j9kgDCoFbv2Kn5",
+          "name": "OpenRouter account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "BTC_4H_TAAPI_Indicator_snapshot",
+        "limit": 1
+      },
+      "type": "n8n-nodes-base.supabaseTool",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        176
+      ],
+      "id": "dff0074f-ed84-4ae1-99b8-bd62713925fc",
+      "name": "Get many rows in Supabase",
+      "rewireOutputLogTo": "ai_tool",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=\nEntry long - {{ $json['Entry Long'] }}\nExit Long - {{ $json['Exit Long'] }}\nEntry Short - {{ $json['Entry Short'] }}\nExit Short - {{ $json['Exit Short'] }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "=You are an AI agent with access to a connected tool called \"DB CHECK\". Your purpose is to analyze trading strategies provided by the user and extract all relevant indicator column names used in the strategy's entry and exit logic.\n\nInstructions:\n\n1. **User Input**: The user will provide:\n   - `Entry Logic` (a string containing the conditions for entering a trade)\n   - `Exit Logic` (a string containing the conditions for exiting a trade)\n\n2. **Fetch Available Indicators**:\n   - Immediately call the \"DB CHECK\" tool to retrieve the full list of available indicators and their columns.\n   - Each indicator has a list of column names (for example: `price_value`, `ema_value`, `rsi_value`,etc).\n\n3. **Parsing Logic**:\n   - Analyze the user-provided entry and exit logic.\n   - Identify which columns from the available indicators are referenced in the logic.\n   - Extract only the column names that are actually used.\n\n4. **Output Format**:\n   - Return the extracted column names as a **comma-separated list**, without duplicates.\n   - Example: `price_value,ema_value,rsi_value,etc`\n\n5. **Constraints**:\n   - Only include columns that exist in the DB CHECK list.\n   - Do not include any other text, explanations, or formatting in the output — only the comma-separated column names.\n\n6. **Error Handling**:\n   - If no columns are matched, return an empty string.\n   - If the entry or exit logic is empty, return an empty string.\n\nExample Flow:\n\nUser Input:  \nEntry Logic: `if price > ema and rsi < 30`  \nExit Logic: `if price < ema or rsi > 70`  \n\nDB CHECK returns available indicators and columns:  \n- `price` → `price_value`  \n- `ema` → `ema_value`  \n- `rsi` → `rsi_value`  \n- `stochrsi FastK` → `stochrsi_FastK`  \n\nOutput:  \n`price_value,ema_value,rsi_value`\n\nYour goal: Always return a clean, accurate, comma-separated list of all indicator columns used in the entry and exit logic based on the DB CHECK data.\n\n- MUST PARSE EXACTLY SAME COLUMN NAME COMING FORM DB.- "
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -576,
+        -16
+      ],
+      "id": "78942ad3-4e61-431a-aac4-b74b16c3d6c3",
+      "name": "Column Name Agent",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n\t\"columns\": \"string\",\n  \t\"entry_logic\": \"string\",\n  \t\"exit_logic\": \"string\"\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -432,
+        176
+      ],
+      "id": "876a4d1d-7b04-4896-9e9b-115403ed41ee",
+      "name": "Structured Output Parser11"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -576,
+        176
+      ],
+      "id": "2af2cf64-584d-4fac-ae19-d10ebdca618b",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        208,
+        176
+      ],
+      "id": "49ea9cc7-4066-49a8-ab30-5e3eddb6dc32",
+      "name": "Google Gemini Chat Model22",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-pro-preview",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        256,
+        384
+      ],
+      "id": "79ae4549-4a7d-48db-969c-d8c86c9ad33b",
+      "name": "Google Gemini Chat Model23",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "naxF1kmpdLFaQd75",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "BACKTESTING CORE",
+        "returnAll": true,
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "58"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -544,
+        416
+      ],
+      "id": "afb4e2d7-83d8-4388-afae-6b15e2fda954",
+      "name": "Get many rows",
+      "credentials": {
+        "supabaseApi": {
+          "id": "HW43uYBOpB1Wm6pM",
+          "name": "AlphaAgentCrypto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "BACKTESTING_CORE",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "Strategy_Name",
+              "condition": "eq",
+              "keyValue": "={{ $json.Strategy_Name }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Perormance",
+              "fieldValue": "={{ $json.Perormance }}"
+            },
+            {
+              "fieldId": "Trade_records",
+              "fieldValue": "={{ $json.Trade_records }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        -336,
+        416
+      ],
+      "id": "b493d9aa-4f5e-4587-9f57-fd55a8903819",
+      "name": "Update a row",
+      "credentials": {
+        "supabaseApi": {
+          "id": "6xHl2PeG30yCQfG0",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b089895f-9f04-45d8-8689-0277d2955a5e",
+              "name": "Setfield",
+              "value": "=Replace Entry/Exit Logic of current Code and give me updated code with new Entry/Exit Logic.\n\n  \n   --entry_long \"((dmi_adx > 25 AND plus_di_value > dmi_minusdi AND price_value > hma_value AND fisher_fisher > fisher_fisher_signal AND cmo_value > 0 AND adosc_value > 0) OR (dmi_adx <= 25 AND price_value > hma_value AND dpo_value > 0 AND stochf_FastK > 20 AND adosc_value > 0))\" \\\n  --entry_short \"((dmi_adx > 25 AND dmi_minusdi > plus_di_value AND price_value < hma_value AND fisher_fisher < fisher_fisher_signal AND cmo_value < 0 AND adosc_value < 0) OR (dmi_adx <= 25 AND price_value < hma_value AND dpo_value < 0 AND stochf_FastK < 80 AND adosc_value < 0))\" \\\n  --exit_long \"(price_value <= entry_price - 1.5 * atr_value) OR (price_value < hma_value) OR (dpo_value < 0) OR (adosc_value < 0) OR (dmi_minusdi > plus_di_value)\" \\\n  --exit_short \"(price_value >= entry_price + 1.5 * atr_value) OR (price_value > hma_value) OR (dpo_value > 0) OR (adosc_value > 0) OR (plus_di_value > dmi_minusdi)\" \\\n\nMake sure don't miss any part and fix all block of code correctly.\n\nColumns name to use for DB mapping - open,close,low,high[Execute previous nodes for preview]\n\nPython code to fix --- \n\n#!/usr/bin/env python3\nimport pandas as pd\nimport numpy as np\nimport os\nimport argparse\nfrom dotenv import load_dotenv\n\n# Load environment variables from .env file\nload_dotenv()\n\n# ==========================================\n# 1. USER CONFIGURATION\n# ==========================================\nclass TemplateConfig:\n    \"\"\"\n    REQUIRED SUPABASE DETAILS:\n    \"\"\"\n    SUPABASE_URL = os.getenv(\"SUPABASE_URL\")\n    SUPABASE_KEY = os.getenv(\"SUPABASE_KEY\")\n    TABLE_NAME = \"BTC_1H_TAAPI_Indicator_snapshot\"\n    EXIT_TABLE_NAME = \"BTC_15min_TAAPI_Indicator_snapshot\"\n    \n    # Strategy Parameters\n    CASH = 1000000\n    COMMISSION = 0.0003\n    MARGIN = 0.33\n    TRADE_ON_CLOSE = False\n    ALLOW_FLIPPING = True \n\n# ==========================================\n# 2. TIME RESTRICTIONS\n# ==========================================\ndef is_downtime(dt_iso):\n    \"\"\"\n    Check if current time is within blackout period:\n    Sat 7 AM IST to Sun 7 PM IST.\n    \"\"\"\n    ist_time = dt_iso + pd.Timedelta(hours=5, minutes=30)\n    \n    weekday = ist_time.weekday() # 5 = Saturday, 6 = Sunday\n    hour = ist_time.hour\n    \n    if weekday == 5 and hour >= 7: return True\n    if weekday == 6 and hour < 19: return True\n    return False\n\n# ==========================================\n# 3. SUPABASE DATA LOADER\n# ==========================================\ndef load_data(config: TemplateConfig, needed_cols: list, table_name: str = None) -> pd.DataFrame:\n    \"\"\"\n    Fetches data from Supabase with pagination.\n    \"\"\"\n    target_table = table_name if table_name else config.TABLE_NAME\n    \n    if not config.SUPABASE_URL or not config.SUPABASE_KEY:\n        raise ValueError(\"Missing SUPABASE_URL or SUPABASE_KEY in environment variables.\")\n\n    from supabase import create_client\n    supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)\n    \n    cols_str = \"*\" \n    \n    limit = 5000 if '1H' in target_table.upper() else 15000 \n    print(f\"Fetching data from table: {target_table} (Max {limit} rows)...\")\n    \n    all_data = []\n    page_size = 1000\n    try:\n        for offset in range(0, limit, page_size):\n            response = (\n                supabase.table(target_table)\n                .select(cols_str)\n                .order('timestamp', desc=True) \n                .range(offset, offset + page_size - 1)\n                .execute()\n            )\n            if hasattr(response, 'error') and response.error:\n                raise ValueError(f\"Supabase Error: {response.error}\")\n            \n            if not response.data: break\n            all_data.extend(response.data)\n            if len(response.data) < page_size: break\n    except Exception as e:\n        print(f\"Fetch failed: {e}\")\n        raise e\n            \n    df = pd.DataFrame(all_data)\n    if df.empty:\n        raise ValueError(f\"No data found in Supabase table: {target_table}\")\n    print(f\"Data fetched: {len(df)} rows.\")\n\n    df.columns = [c.lower() for c in df.columns]\n\n    ts_col = 'timestamp' if 'timestamp' in df.columns else None\n    if not ts_col:\n        time_cols = [c for c in df.columns if 'time' in c.lower()]\n        if time_cols: ts_col = time_cols[0]\n\n    if ts_col:\n        print(f\"Converting timestamp column: {ts_col}\")\n        try:\n            sample = df[ts_col].iloc[0]\n            if isinstance(sample, (int, float)) or (isinstance(sample, str) and sample.replace('.','',1).isdigit()):\n                val = float(sample)\n                unit = 's' if val < 1e12 else 'ms'\n                df[ts_col] = pd.to_datetime(df[ts_col].astype(float), unit=unit)\n            else:\n                df[ts_col] = pd.to_datetime(df[ts_col])\n            df.set_index(ts_col, inplace=True)\n        except Exception as e:\n            print(f\"Timestamp conversion error: {e}\")\n            raise e\n    \n    if not isinstance(df.index, pd.DatetimeIndex):\n        print(\"Ensuring DatetimeIndex...\")\n        df.index = pd.to_datetime(df.index)\n\n    print(\"Converting columns to numeric...\")\n    for col in df.columns:\n        df[col] = pd.to_numeric(df[col], errors='coerce')\n    \n    print(\"Filling missing values...\")\n    df = df.ffill().bfill()\n    df = df[~df.index.duplicated(keep='first')]\n    \n    return df.sort_index()\n\n# ==========================================\n# 4. CUSTOM BACKTEST ENGINE\n# ==========================================\n\nclass Position:\n    def __init__(self, size=0, entry_price=0, entry_time=None, is_long=True):\n        self.size = size \n        self.entry_price = entry_price\n        self.entry_time = entry_time\n        self.is_long = is_long\n        self.is_short = not is_long\n\nclass BaseStrategy:\n    def __init__(self, data, cash, commission, leverage):\n        self.data = data \n        self.cash = cash\n        self.commission = commission\n        self.leverage = leverage\n        self.position = None\n        self.closed_pnls = [] \n        \n    def buy(self, size=0.99):\n        if self.position: return \n        entry_t = self.data.index[-1] + pd.Timedelta(hours=1)\n        self.position = Position(size=size, entry_price=self.data['close'].iloc[-1], \n                                 entry_time=entry_t, is_long=True)\n\n    def sell(self, size=0.99):\n        if self.position: return \n        entry_t = self.data.index[-1] + pd.Timedelta(hours=1)\n        self.position = Position(size=size, entry_price=self.data['close'].iloc[-1], \n                                 entry_time=entry_t, is_long=False)\n\n    def _close_position(self, current_price, reason=\"Manual\", exit_time=None):\n        if not self.position: return\n        \n        entry_p = self.position.entry_price\n        entry_t = self.position.entry_time\n        exit_t = exit_time if exit_time is not None else self.data.index[-1] + pd.Timedelta(hours=1)\n        is_long = self.position.is_long\n        \n        if is_long:\n            pnl_pct = (current_price - entry_p) / entry_p\n        else:\n            pnl_pct = (entry_p - current_price) / entry_p\n        \n        leveraged_pnl = pnl_pct * self.leverage\n        final_pnl = leveraged_pnl - (self.commission * 2 * self.leverage)\n        \n        self.closed_pnls.append(final_pnl)\n        \n        if not hasattr(self, 'trade_history'): self.trade_history = []\n        self.trade_history.append({\n            'entry_time': entry_t,\n            'exit_time': exit_t,\n            'type': 'LONG' if is_long else 'SHORT',\n            'entry_price': entry_p,\n            'exit_price': current_price,\n            'pnl': final_pnl,\n            'reason': reason\n        })\n        \n        self.position = None\n\nclass Backtest:\n    def __init__(self, data, strategy_class, data_15m=None, cash=10000, commission=0, margin=1.0, trade_on_close=True, finalize_trades=True):\n        self.data = data\n        self.data_15m = data_15m\n        self.strategy_class = strategy_class\n        self.cash = cash\n        self.commission = commission\n        self.margin = margin\n        self.leverage = round(1.0 / margin) if margin > 0 else 1\n        self.finalize_trades = finalize_trades\n\n    def run(self, **kwargs):\n        strategy = self.strategy_class(self.data, self.cash, self.commission, self.leverage)\n        strategy.data_15m = self.data_15m\n        for k, v in kwargs.items():\n            setattr(strategy, k, v)\n        \n        strategy.init()\n        \n        for i in range(2, len(self.data) + 1):\n            strategy.data = self.data.iloc[:i]\n            strategy.next()\n            \n        if self.finalize_trades and strategy.position:\n            strategy._close_position(self.data.close.iloc[-1], reason=\"Finalize\")\n            \n        total_val = self.cash\n        for p in strategy.closed_pnls:\n            total_val *= (1 + p)\n        final_return = ((total_val / self.cash) - 1) * 100\n\n        pnls = strategy.closed_pnls\n        wins = [p for p in pnls if p > 0]\n        losses = [p for p in pnls if p < 0]\n        win_rate = (len(wins) / len(pnls) * 100) if pnls else 0\n        gross_profit = sum(wins)\n        gross_loss = abs(sum(losses))\n        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (100.0 if gross_profit > 0 else 0)\n        sharpe = (np.mean(pnls) / np.std(pnls)) if len(pnls) > 1 and np.std(pnls) > 0 else 0\n        \n        return {\n            'Return [%]': final_return,\n            '# Trades': len(pnls),\n            'Win Rate [%]': win_rate,\n            'Profit Factor': profit_factor,\n            'Sharpe Ratio': sharpe,\n            'History': getattr(strategy, 'trade_history', [])\n        }\n\n# ==========================================\n# 5. STRATEGY ENGINE\n# ==========================================\nclass MyStrategy(BaseStrategy):\n    mode = 'both'\n    data_freq_hours = 1 \n    verbose = False \n    data_15m = None\n    ALLOW_FLIPPING = True\n    \n    def init(self):\n        self.entry_price = 0\n        self.entry_bar = 0\n        self.processed_timestamps = set()\n\n    def next(self):\n        current_time = self.data.index[-1]\n        current_price = self.data['close'].iloc[-1]\n        \n        if current_time in self.processed_timestamps:\n            return\n        self.processed_timestamps.add(current_time)\n        \n        if is_downtime(current_time):\n            if self.position: \n                end_t = current_time + pd.Timedelta(hours=1)\n                self._close_position(current_price, reason=\"Downtime\", exit_time=end_t)\n            return\n\n        row = self.data.iloc[-1]\n            \n        def _get_val(key, default=0):\n            val = row.get(key, default)\n            try:\n                return float(val)\n            except (ValueError, TypeError):\n                return float(default)\n\n        dmi_adx = _get_val('dmi_adx', 0)\n        plus_di_value = _get_val('plus_di_value', 0)\n        dmi_minusdi = _get_val('dmi_minusdi', 0)\n        price_value = _get_val('price_value', row['close'])\n        hma_value = _get_val('hma_value', 0)\n        fisher_fisher = _get_val('fisher_fisher', 0)\n        fisher_fisher_signal = _get_val('fisher_fisher_signal', 0)\n        cmo_value = _get_val('cmo_value', 0)\n        adosc_value = _get_val('adosc_value', 0)\n        dpo_value = _get_val('dpo_value', 0)\n        stochf_FastK = _get_val('stochf_fastk', 0) \n        atr_value = _get_val('atr_value', 0)\n        \n        # --- Exit Logic ---\n        is_exit_long_signal = False\n        is_exit_short_signal = False\n\n        if self.position:\n            entry_price_pos = self.position.entry_price\n\n            if self.position.is_long:\n                if (price_value <= entry_price_pos - 1.5 * atr_value) or \\\n                   (price_value < hma_value) or \\\n                   (dpo_value < 0) or \\\n                   (adosc_value < 0) or \\\n                   (dmi_minusdi > plus_di_value):\n                    is_exit_long_signal = True\n            else:\n                if (price_value >= entry_price_pos + 1.5 * atr_value) or \\\n                   (price_value > hma_value) or \\\n                   (dpo_value > 0) or \\\n                   (adosc_value > 0) or \\\n                   (plus_di_value > dmi_minusdi):\n                    is_exit_short_signal = True\n        \n            if is_exit_long_signal and self.position.is_long:\n                if self.verbose: print(f\"[{current_time}] LONG Exit Signal @ {current_price:.2f}\")\n                self._close_position(current_price, reason=\"Exit Long Signal\", exit_time=current_time)\n                if not self.ALLOW_FLIPPING: return\n\n            if is_exit_short_signal and self.position.is_short:\n                if self.verbose: print(f\"[{current_time}] SHORT Exit Signal @ {current_price:.2f}\")\n                self._close_position(current_price, reason=\"Exit Short Signal\", exit_time=current_time)\n                if not self.ALLOW_FLIPPING: return\n\n        # --- Entry Logic ---\n        is_long_signal = False\n        is_short_signal = False\n        \n        entry_long_cond1 = (dmi_adx > 25 and plus_di_value > dmi_minusdi and price_value > hma_value and fisher_fisher > fisher_fisher_signal and cmo_value > 0 and adosc_value > 0)\n        entry_long_cond2 = (dmi_adx <= 25 and price_value > hma_value and dpo_value > 0 and stochf_FastK > 20 and adosc_value > 0)\n        if entry_long_cond1 or entry_long_cond2:\n            is_long_signal = True\n            \n        entry_short_cond1 = (dmi_adx > 25 and dmi_minusdi > plus_di_value and price_value < hma_value and fisher_fisher < fisher_fisher_signal and cmo_value < 0 and adosc_value < 0)\n        entry_short_cond2 = (dmi_adx <= 25 and price_value < hma_value and dpo_value < 0 and stochf_FastK < 80 and adosc_value < 0)\n        if entry_short_cond1 or entry_short_cond2:\n            is_short_signal = True\n\n        if not self.position:\n            if self.mode in ['both', 'long'] and is_long_signal:\n                self.buy(size=0.99)\n                self.entry_price = price_value\n                self.entry_bar = len(self.data)\n                if self.verbose: print(f\"[{current_time}] LONG Entry Signal @ {price_value:.2f}\")\n\n            if self.mode in ['both', 'short'] and is_short_signal:\n                self.sell(size=0.99)\n                self.entry_price = price_value\n                self.entry_bar = len(self.data)\n                if self.verbose: print(f\"[{current_time}] SHORT Entry Signal @ {price_value:.2f}\")\n\n\n# ==========================================\n# 6. OUTPUT HELPERS\n# ==========================================\n\ndef _color(text, code):\n    \"\"\"Wrap text in ANSI color code.\"\"\"\n    return f\"\\033[{code}m{text}\\033[0m\"\n\ndef _fmt_return(val):\n    s = f\"{val:+.2f}%\"\n    return _color(s, \"32\") if val >= 0 else _color(s, \"31\")\n\ndef _fmt_pnl(val):\n    s = f\"{val*100:+.2f}%\"\n    return _color(s, \"32\") if val >= 0 else _color(s, \"31\")\n\ndef _bar(val, width=10):\n    \"\"\"Simple ASCII bar for win rate (0-100).\"\"\"\n    filled = round(val / 100 * width)\n    return \"█\" * filled + \"░\" * (width - filled)\n\ndef print_summary_table(results_by_period):\n    \"\"\"\n    Print a clean, structured performance summary table.\n    results_by_period: list of dicts with keys: period, mode, stats\n    \"\"\"\n    COL_W = [12, 7, 11, 5, 17, 6, 7]  # widths for each column\n    HEADERS = [\"Period\", \"Mode\", \"Return\", \"Trd\", \"Win Rate\", \"PF\", \"Sharpe\"]\n\n    sep = \"+\" + \"+\".join(\"-\" * (w + 2) for w in COL_W) + \"+\"\n    header_row = \"|\" + \"|\".join(f\" {h:<{w}} \" for h, w in zip(HEADERS, COL_W)) + \"|\"\n\n    print()\n    print(\"=\" * (sum(COL_W) + len(COL_W) * 3 + 1))\n    print(\"  MARKET PHASE ADAPTIVE STRATEGY  —  Performance Report\")\n    print(\"=\" * (sum(COL_W) + len(COL_W) * 3 + 1))\n    print(sep)\n    print(header_row)\n    print(sep.replace(\"-\", \"=\"))\n\n    prev_period = None\n    for row in results_by_period:\n        period    = row['period']\n        mode      = row['mode']\n        stats     = row['stats']\n        ret       = stats['Return [%]']\n        n_trades  = stats['# Trades']\n        win_rate  = stats['Win Rate [%]']\n        pf        = stats['Profit Factor']\n        sharpe    = stats['Sharpe Ratio']\n\n        period_label = period if period != prev_period else \"\"\n        ret_str    = f\"{ret:+.2f}%\"\n        wr_str     = f\"{win_rate:4.1f}%  {_bar(win_rate, 8)}\"\n        pf_str     = f\"{pf:.2f}\"\n        sh_str     = f\"{sharpe:+.2f}\"\n\n        mode_display = {\"both\": \"Both\", \"long\": \"Long ↑\", \"short\": \"Short ↓\"}.get(mode, mode)\n\n        cells = [\n            f\"{period_label:<{COL_W[0]}}\",\n            f\"{mode_display:<{COL_W[1]}}\",\n            f\"{ret_str:>{COL_W[2]}}\",\n            f\"{n_trades:>{COL_W[3]}}\",\n            f\"{wr_str:<{COL_W[4]}}\",\n            f\"{pf_str:>{COL_W[5]}}\",\n            f\"{sh_str:>{COL_W[6]}}\",\n        ]\n        print(\"|\" + \"|\".join(f\" {c} \" for c in cells) + \"|\")\n\n        # Separator between periods\n        if period != prev_period and prev_period is not None:\n            pass  # already handled below\n        prev_period = period\n\n        # After each group of 3 modes, print a divider\n        if mode == 'short':\n            print(sep)\n\n    print()\n\n\ndef print_trade_history(label, trades):\n    \"\"\"Print a well-formatted trade history table for a given period.\"\"\"\n    COL_W = [18, 18, 6, 10, 10, 9, 20]\n    HEADERS = [\"Entry Time\", \"Exit Time\", \"Type\", \"Entry\", \"Exit\", \"PnL %\", \"Reason\"]\n\n    sep = \"+\" + \"+\".join(\"-\" * (w + 2) for w in COL_W) + \"+\"\n    header_row = \"|\" + \"|\".join(f\" {h:<{w}} \" for h, w in zip(HEADERS, COL_W)) + \"|\"\n\n    print()\n    print(f\"  Trade History — {label}\")\n    print(sep)\n    print(header_row)\n    print(sep.replace(\"-\", \"=\"))\n\n    for t in trades:\n        entry_t = t['entry_time']\n        exit_t  = t['exit_time']\n        e_str   = entry_t.strftime('%Y-%m-%d %H:%M') if hasattr(entry_t, 'strftime') else str(entry_t)\n        x_str   = exit_t.strftime('%Y-%m-%d %H:%M') if hasattr(exit_t, 'strftime') else str(exit_t)\n        pnl_str = f\"{t['pnl']*100:+.2f}%\"\n        t_type  = t['type']\n        reason  = t['reason'][:20]\n\n        cells = [\n            f\"{e_str:<{COL_W[0]}}\",\n            f\"{x_str:<{COL_W[1]}}\",\n            f\"{t_type:<{COL_W[2]}}\",\n            f\"{t['entry_price']:>{COL_W[3]}.2f}\",\n            f\"{t['exit_price']:>{COL_W[4]}.2f}\",\n            f\"{pnl_str:>{COL_W[5]}}\",\n            f\"{reason:<{COL_W[6]}}\",\n        ]\n        print(\"|\" + \"|\".join(f\" {c} \" for c in cells) + \"|\")\n\n    print(sep)\n    print(f\"  Total trades: {len(trades)}\")\n    print()\n\n\n# ==========================================\n# 7. MAIN\n# ==========================================\ndef main():\n    parser = argparse.ArgumentParser(description=\"Market Phase Adaptive Strategy - Hardcoded\")\n    parser.add_argument(\"--table\", type=str, default=\"BTC_1H_TAAPI_Indicator_snapshot\")\n    parser.add_argument(\"--exit_table\", type=str, default=\"BTC_15min_TAAPI_Indicator_snapshot\")\n    parser.add_argument(\"--cash\", type=float, default=1000000)\n    parser.add_argument(\"--commission\", type=float, default=0.0003)\n    parser.add_argument(\"--margin\", type=float, default=0.33)\n    parser.add_argument(\"--verbose\", action=\"store_true\",\n                        help=\"Show per-signal entry/exit logs\")\n    args = parser.parse_args()\n\n    config = TemplateConfig()\n    config.TABLE_NAME = args.table\n    config.EXIT_TABLE_NAME = args.exit_table\n    config.CASH = args.cash\n    config.COMMISSION = args.commission\n    config.MARGIN = args.margin\n    \n    needed_cols = ['open', 'high', 'low', 'close', 'volume', 'timestamp', 'price_value',\n                   'dmi_adx', 'plus_di_value', 'dmi_minusdi', 'hma_value',\n                   'fisher_fisher', 'fisher_fisher_signal', 'cmo_value', 'adosc_value',\n                   'dpo_value', 'stochf_FastK', 'atr_value']\n    \n    try:\n        df = load_data(config, needed_cols)\n    except Exception as e:\n        print(f\"Error loading main data: {e}\")\n        return\n        \n    try:\n        df_15m = load_data(config, ['open', 'high', 'low', 'close', 'timestamp'], table_name=config.EXIT_TABLE_NAME)\n    except Exception as e:\n        print(f\"Warning: Could not load exit table {config.EXIT_TABLE_NAME}: {e}. Falling back to 1H exits.\")\n        df_15m = None\n\n    if df.empty or len(df) < 2:\n        print(\"Error: Insufficient data.\")\n        return\n\n    # Verbose only if explicitly requested\n    MyStrategy.verbose = args.verbose\n\n    periods = {\n        '6 Months': pd.Timedelta(days=180), \n        '1 Month':  pd.Timedelta(days=30),\n        '1 Week':   pd.Timedelta(days=7),\n        '1 Day':    pd.Timedelta(days=1),\n    }\n    last_dt = df.index[-1]\n    modes   = ['both', 'long', 'short']\n\n    results_by_period = []\n    trade_history_1m  = None\n\n    print(\"\\nRunning backtests...\\n\")\n\n    for label, delta in periods.items():\n        start_dt  = last_dt - delta\n        sliced_df = df[df.index >= start_dt]\n        if sliced_df.empty:\n            continue\n\n        for mode in modes:\n            MyStrategy.mode = mode\n            bt    = Backtest(sliced_df, MyStrategy, data_15m=df_15m,\n                             cash=config.CASH, commission=config.COMMISSION, margin=config.MARGIN)\n            stats = bt.run()\n\n            results_by_period.append({'period': label, 'mode': mode, 'stats': stats})\n\n            # Capture 1-month 'both' trade history for detailed printout\n            if label == '1 Month' and mode == 'both':\n                trade_history_1m = stats['History']\n\n    # ── Structured output ────────────────────────────────────────────────────\n    print_summary_table(results_by_period)\n\n    if trade_history_1m is not None:\n        print_trade_history(\"1 Month  (mode=both)\", trade_history_1m)\n\n\nif __name__ == \"__main__\":\n    main()",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        624,
+        352
+      ],
+      "id": "7c7c3af5-4db1-46e3-b77a-d181397c0c7d",
+      "name": "Create Command Line6"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-opus-4-6",
+          "mode": "list",
+          "cachedResultName": "Claude Opus 4.6"
+        },
+        "options": {
+          "thinking": true
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        48,
+        272
+      ],
+      "id": "cf2249e6-6a1b-473c-9963-2cdc90418426",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "8RBZUcKQbbKdVThR",
+          "name": "Anthropic account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Session ID Generator": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser1": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command": {
+      "main": [
+        [
+          {
+            "node": "Execute a command4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command4": {
+      "main": [
+        [
+          {
+            "node": "AI Agent4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line3": {
+      "main": [
+        [
+          {
+            "node": "Execute a command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line": {
+      "main": [
+        [
+          {
+            "node": "Execute a command5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command5": {
+      "main": [
+        [
+          {
+            "node": "Execute a command6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command6": {
+      "main": [
+        [
+          {
+            "node": "AI Agent5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent2": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory2": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model4": {
+      "ai_languageModel": [
+        []
+      ]
+    },
+    "Google Gemini Chat Model5": {
+      "ai_languageModel": [
+        []
+      ]
+    },
+    "Structured Output Parser2": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line1": {
+      "main": [
+        [
+          {
+            "node": "Execute a command7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command7": {
+      "main": [
+        [
+          {
+            "node": "Execute a command8",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command8": {
+      "main": [
+        [
+          {
+            "node": "AI Agent6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent3": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory3": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent3",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model6": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent3",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model7": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent3",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser3": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent3",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line2": {
+      "main": [
+        [
+          {
+            "node": "Execute a command9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command9": {
+      "main": [
+        [
+          {
+            "node": "Execute a command10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command10": {
+      "main": [
+        [
+          {
+            "node": "AI Agent7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent4": {
+      "main": [
+        [
+          {
+            "node": "If3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model8": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent4",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model9": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent4",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser4": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent4",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If3": {
+      "main": [
+        [
+          {
+            "node": "Create a row2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create a row2": {
+      "main": [
+        []
+      ]
+    },
+    "AI Agent5": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model10": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent5",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model11": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent5",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser5": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent5",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Create a row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create a row": {
+      "main": [
+        []
+      ]
+    },
+    "AI Agent6": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model12": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent6",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model13": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent6",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser6": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent6",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Create a row1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent7": {
+      "main": [
+        [
+          {
+            "node": "If4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model14": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent7",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model15": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent7",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser7": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent7",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If4": {
+      "main": [
+        [
+          {
+            "node": "Create a row3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent8",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Column Name Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent8": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory4": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent8",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser8": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent8",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line4": {
+      "main": [
+        [
+          {
+            "node": "Execute a command11",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command11": {
+      "main": [
+        [
+          {
+            "node": "Execute a command12",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command12": {
+      "main": [
+        [
+          {
+            "node": "AI Agent10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent9": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory5": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent9",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model18": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent9",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model19": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent9",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser9": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent9",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line5": {
+      "main": [
+        [
+          {
+            "node": "Execute a command13",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command13": {
+      "main": [
+        [
+          {
+            "node": "Execute a command14",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command14": {
+      "main": [
+        [
+          {
+            "node": "DebugHelper",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent10": {
+      "main": [
+        [
+          {
+            "node": "If5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model20": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent10",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model21": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent10",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser10": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Agent10",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If5": {
+      "main": [
+        [
+          {
+            "node": "Create a row4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "OpenRouter Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent8",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent8",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get many rows in Supabase": {
+      "ai_tool": [
+        [
+          {
+            "node": "Column Name Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Column Name Agent": {
+      "main": [
+        [
+          {
+            "node": "Session ID Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser11": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Column Name Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Column Name Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model22": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model23": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get many rows": {
+      "main": [
+        [
+          {
+            "node": "Update a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Command Line6": {
+      "main": [
+        [
+          {
+            "node": "Create Command Line6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "When Executed by Another Workflow": [
+      {
+        "Entry Long": "((aroon_AroonDown > 85.0) AND (vortex_minus > 1.12) AND (macdext_MACDHist < -30.0) AND (stochrsi_FastK < 12.0)),",
+        "Exit Long": "((rsi_value > 58.0) OR (close > entry_price + 1.8 * atr_value) OR (close < entry_price - 1.4 * atr_value)),",
+        "Entry Short": "((macdext_MACDHist > 15.41) AND (cmo_value > 25.0) AND (rsi_value > 60.0) AND (close < bbands_UpperBand)),",
+        "Exit Short": "((rsi_value < 30.0) OR (close > supertrend_value) OR (close > entry_price + 1.2 * atr_value))",
+        "Table Name": "ETH_4H",
+        "Supporting Table": "ETH_1H"
+      }
+    ]
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "fdcb0a4f1a4e7adc4302d786579018ea52d7fb8fdf4d4613277a176517826a73"
+  }
+}

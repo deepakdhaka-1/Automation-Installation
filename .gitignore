@@ -1,0 +1,24 @@
+# Runtime env files
+.env
+*.env
+
+# n8n runtime data
+n8n-service/n8n-data/
+
+# Supabase runtime data
+supabase-service/volumes/
+supabase-service/db-data/
+supabase-service/storage-data/
+
+# Backups and archives
+*.tar
+*.tar.gz
+*.zip
+*.bak
+*.backup*
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+

@@ -7,19 +7,7 @@ services:
       - "5678:5678"
     env_file:
       - .env
+    extra_hosts:
+      - "supabase.alphaagentx.com:35.236.134.87"
     volumes:
       - ./n8n-data:/home/node/.n8n
-
-  task-runners:
-    build:
-      context: .
-      dockerfile: Dockerfile.runners
-    container_name: n8n-runners
-    restart: always
-    environment:
-      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n-server:5679
-      - N8N_RUNNERS_AUTH_TOKEN=${N8N_RUNNERS_AUTH_TOKEN}
-      - N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT=0
-      - N8N_RUNNERS_LAUNCHER_LOG_LEVEL=info
-    depends_on:
-      - n8n

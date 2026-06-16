@@ -10,6 +10,10 @@ supabase-service/volumes/
 supabase-service/db-data/
 supabase-service/storage-data/
 
+# Crawl4AI runtime data
+crawl4ai-service/data/
+crawl4ai-service/cache/
+
 # Backups and archives
 *.tar
 *.tar.gz
@@ -21,4 +25,3 @@ supabase-service/storage-data/
 *.pem
 *.key
 *.crt
-

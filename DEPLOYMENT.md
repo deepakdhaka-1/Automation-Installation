@@ -14,6 +14,7 @@ Supabase public subdomain
 Supabase Postgres password
 n8n login username/password
 Supabase Studio username/password
+Crawl4AI Gemini API token, if Crawl4AI should be deployed or recreated
 Optional Certbot email
 ```
 
@@ -36,6 +37,7 @@ Deploy two services on one VM:
 | --- | --- | --- | --- |
 | n8n | Docker Compose | operator-provided n8n domain | `5678` |
 | Supabase | Docker Compose | operator-provided Supabase domain | `8000` through Supabase Kong |
+| Crawl4AI | Docker container or Docker Compose | direct VM port unless a domain is requested | `11235` |
 
 nginx terminates HTTPS and reverse proxies to the containers.
 
@@ -50,6 +52,8 @@ docker system prune -a
 docker volume prune
 rm -rf /home/contact/*
 ```
+
+Be especially careful with the existing `crawl4ai` container. If it exists but is stopped, prefer `docker start crawl4ai` over deleting/recreating it.
 
 Do not commit real `.env` files, passwords, JWT secrets, database data, TLS private keys, or Docker volumes.
 
@@ -184,6 +188,51 @@ Expected container:
 n8n-server
 ```
 
+## Deploy Or Recover Crawl4AI
+
+First check whether an existing container already exists:
+
+```bash
+docker ps -a --filter name=crawl4ai --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+```
+
+If the container exists but is stopped, recover it:
+
+```bash
+docker update --restart unless-stopped crawl4ai
+docker start crawl4ai
+```
+
+Verify:
+
+```bash
+docker ps --filter name=crawl4ai
+curl -sS http://127.0.0.1:11235/health
+```
+
+Expected: the container is up and `/health` returns JSON with `"status":"ok"`.
+
+If no container exists, deploy from this repo:
+
+```bash
+mkdir -p /home/contact/crawl4ai-service
+cp /home/contact/Automation-Installation/crawl4ai-service/docker-compose.yml /home/contact/crawl4ai-service/docker-compose.yml
+cp /home/contact/Automation-Installation/crawl4ai-service/.env.example /home/contact/crawl4ai-service/.env
+cd /home/contact/crawl4ai-service
+nano .env
+docker compose up -d
+```
+
+Set `GEMINI_API_TOKEN` in `.env` if Crawl4AI workflows need Gemini-backed features.
+
+Current expected local endpoints:
+
+```text
+http://127.0.0.1:11235/health
+http://127.0.0.1:11235/docs
+http://127.0.0.1:11235/openapi.json
+```
+
 ## Deploy Supabase
 
 Self-hosted Supabase should be deployed from Supabase's official Docker files.
@@ -295,6 +344,13 @@ curl -I https://<n8n-domain>
 docker ps --filter name=n8n-server
 ```
 
+Verify Crawl4AI:
+
+```bash
+docker ps --filter name=crawl4ai
+curl -sS http://127.0.0.1:11235/health
+```
+
 Verify Supabase:
 
 ```bash
@@ -398,6 +454,16 @@ docker logs --tail 200 <container-name>
 docker inspect <container-name> --format '{{json .State.Health}}'
 ```
 
+If Crawl4AI is offline:
+
+```bash
+docker ps -a --filter name=crawl4ai
+docker logs --tail 120 crawl4ai
+docker update --restart unless-stopped crawl4ai
+docker start crawl4ai
+curl -sS http://127.0.0.1:11235/health
+```
+
 ## Final Report Expected From Agent
 
 At the end of deployment, report:
@@ -409,6 +475,6 @@ Container status summary
 nginx config test result
 Certbot certificate status
 n8n-to-Supabase API test result
+Crawl4AI health status
 Any credentials the operator must rotate or preserve
 ```
-

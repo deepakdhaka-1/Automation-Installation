@@ -1,0 +1,10 @@
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:0.8.0
+    container_name: crawl4ai
+    restart: unless-stopped
+    ports:
+      - "11235:11235"
+    env_file:
+      - .env
+

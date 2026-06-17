@@ -38,6 +38,7 @@ Deploy two services on one VM:
 | n8n | Docker Compose | operator-provided n8n domain | `5678` |
 | Supabase | Docker Compose | operator-provided Supabase domain | `8000` through Supabase Kong |
 | Crawl4AI | Docker container or Docker Compose | direct VM port unless a domain is requested | `11235` |
+| Supabase MCP | Supabase Studio behind Kong | SSH tunnel only | `/mcp` through `localhost:8000` |
 
 nginx terminates HTTPS and reverse proxies to the containers.
 
@@ -312,6 +313,17 @@ curl -I http://127.0.0.1:5678
 curl -I http://127.0.0.1:8000
 ```
 
+The Supabase nginx site must block MCP publicly:
+
+```nginx
+location = /mcp { return 403; }
+location ^~ /mcp/ { return 403; }
+location = /api/mcp { return 403; }
+location ^~ /api/mcp/ { return 403; }
+```
+
+MCP should be reached only through an SSH tunnel to the VM's local Kong port.
+
 ## Issue HTTPS Certificates
 
 Run Certbot only after DNS resolves to the VM:
@@ -378,6 +390,111 @@ Expected:
 
 ```text
 status=200 type=application/openapi+json
+```
+
+## Enable And Verify Supabase MCP
+
+Supabase self-hosted MCP runs behind Studio and Kong. It must not be exposed to the Internet. Enable it only for local/tunneled access.
+
+Find the Docker bridge gateway IP used by Kong:
+
+```bash
+cd /home/contact/supabase-project/supabase/docker
+docker inspect supabase-kong --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}'
+```
+
+Edit:
+
+```text
+/home/contact/supabase-project/supabase/docker/volumes/api/kong.yml
+```
+
+In the `## MCP endpoint - local access` service block:
+
+1. Remove or comment the `request-termination` plugin under the `/mcp` route.
+2. Enable `cors`.
+3. Enable `ip-restriction`.
+4. Allow `127.0.0.1`, `::1`, and the Docker bridge gateway IP.
+5. Keep `deny: []`.
+
+Expected plugin block:
+
+```yaml
+plugins:
+  - name: cors
+  - name: ip-restriction
+    config:
+      allow:
+        - 127.0.0.1
+        - ::1
+        - <docker-bridge-gateway-ip>
+      deny: []
+```
+
+Restart only Kong:
+
+```bash
+docker compose restart kong
+```
+
+Verify local MCP initialize:
+
+```bash
+curl http://127.0.0.1:8000/mcp \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": { "elicitation": {} },
+      "clientInfo": {
+        "name": "test-client",
+        "title": "Test Client",
+        "version": "1.0.0"
+      }
+    }
+  }'
+```
+
+Expected response:
+
+```text
+"serverInfo":{"name":"supabase"
+```
+
+Verify public MCP is blocked:
+
+```bash
+curl -i https://<supabase-domain>/mcp
+```
+
+Expected:
+
+```text
+403 Forbidden
+```
+
+Use this SSH tunnel from a local machine:
+
+```bash
+ssh -L localhost:8080:localhost:8000 <ssh-user>@<vm-ip>
+```
+
+Then configure the MCP client:
+
+```json
+{
+  "mcpServers": {
+    "supabase-self-hosted": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
 ```
 
 ## Verify n8n Can Reach Supabase
@@ -475,6 +592,7 @@ Container status summary
 nginx config test result
 Certbot certificate status
 n8n-to-Supabase API test result
+Supabase MCP local initialize result and public block result
 Crawl4AI health status
 Any credentials the operator must rotate or preserve
 ```

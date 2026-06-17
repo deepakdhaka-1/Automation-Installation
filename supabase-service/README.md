@@ -89,3 +89,71 @@ apikey: <service_role_jwt>
 Authorization: Bearer <service_role_jwt>
 ```
 
+## Enable MCP
+
+Supabase self-hosted Studio includes an MCP endpoint behind Kong:
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+Do not expose this endpoint publicly. Access it through an SSH tunnel only.
+
+The live setup enables `/mcp` in `volumes/api/kong.yml` for local/tunneled access and blocks public access in nginx:
+
+```text
+https://supabase.alphaagentx.com/mcp -> 403
+```
+
+Use an SSH tunnel from your local machine:
+
+```bash
+ssh -L localhost:8080:localhost:8000 contact@35.236.134.87
+```
+
+Then configure the MCP client with:
+
+```json
+{
+  "mcpServers": {
+    "supabase-self-hosted": {
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+Verify from the VM:
+
+```bash
+curl http://127.0.0.1:8000/mcp \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": { "elicitation": {} },
+      "clientInfo": {
+        "name": "test-client",
+        "title": "Test Client",
+        "version": "1.0.0"
+      }
+    }
+  }'
+```
+
+Expected response includes:
+
+```json
+{
+  "serverInfo": {
+    "name": "supabase",
+    "version": "0.7.0"
+  }
+}
+```
